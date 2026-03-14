@@ -63,3 +63,55 @@ curl -X POST http://localhost:3000/experiment \
 
 - `main.go` — replaced single hardcoded payload with multi-payload loading + MurmurHash3 bucketing + request validation
 - `go.mod` / `go.sum` — added `github.com/spaolacci/murmur3` dependency
+
+---
+
+## Task 2: Load Test for Experimental Allocation Verification
+
+### What Changed
+
+The existing load test (`cmd/loadtest/main.go`) now verifies allocation determinism alongside performance metrics. Each client sends requests with a stable `userId` (UUID), and the test checks that every user always receives the same payload across all their requests.
+
+### What Was Added
+
+1. **User identity per client** — each fast/slow client gets a unique UUID at startup and sends it as `userId` in every request.
+2. **Allocation tracking** — every response is parsed and the `selectedPayloadName` is recorded per user. After the test, the results are analyzed for consistency.
+3. **Determinism check** — verifies that each user received exactly one payload across all their requests. If any user got different payloads on different requests, the test reports FAIL.
+4. **Payload distribution** — shows how users are split across the 6 cohorts with a visual bar chart.
+5. **Results file output** — all performance and allocation results are written to a markdown file (`load_test_results.md` by default, configurable via `-output` flag).
+
+### How to Run
+
+```bash
+# Normal mode (fast clients only)
+go run cmd/loadtest/main.go -fast 10 -requests 20 -duration 15s
+
+# With slow clients (saturation mode)
+go run cmd/loadtest/main.go -fast 10 -slow 5 -requests 20 -duration 30s -mode saturation
+
+# Custom output file
+go run cmd/loadtest/main.go -fast 10 -requests 20 -duration 15s -output my_results.md
+```
+
+### Sample Output (Allocation Section)
+
+```
+Allocation Determinism Check:
+  Total Users:      60
+  Consistent:       60/60 (100.0%)
+  Inconsistent:     0
+  PASS - Every user received the same payload on every request
+
+Payload Distribution:
+  localization_dummy_3.json             8 users ( 13.3%) ######
+  localization_dummy_4.json            10 users ( 16.7%) ########
+  localization_example.json             8 users ( 13.3%) ######
+  localization_example_2.json          12 users ( 20.0%) ##########
+  nested_large.json                    12 users ( 20.0%) ##########
+  small_payload.json                   10 users ( 16.7%) ########
+```
+
+### Files Modified
+
+- `cmd/loadtest/main.go` — added userId per client, allocation tracking, determinism analysis, and file output
+- `cmd/allocation-test/main.go` — standalone allocation test (can also be used independently)

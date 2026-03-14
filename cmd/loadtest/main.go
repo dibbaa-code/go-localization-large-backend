@@ -8,11 +8,21 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
+
+// ExperimentResponse matches the server's model.Response
+type ExperimentResponse struct {
+	ExperimentID        string `json:"experimentId"`
+	SelectedPayloadName string `json:"selectedPayloadName"`
+	Payload             string `json:"payload"`
+}
 
 type TestConfig struct {
 	ServerURL         string
@@ -21,7 +31,8 @@ type TestConfig struct {
 	RequestsPerClient int
 	SlowDownloadSpeed int // bytes per second for slow clients
 	TestDuration      time.Duration
-	ConnectionHogTest bool // Special mode to demonstrate connection hogging
+	ConnectionHogTest bool   // Special mode to demonstrate connection hogging
+	OutputFile        string // File to write results to
 }
 
 type Stats struct {
@@ -33,6 +44,10 @@ type Stats struct {
 	latenciesMutex  sync.Mutex
 	fastLatencies   []int64 // fast client latencies in milliseconds
 	slowLatencies   []int64 // slow client latencies in milliseconds
+
+	// Allocation tracking: userId -> map[payloadName]count
+	allocationMu sync.Mutex
+	allocations  map[string]map[string]int
 }
 
 // SlowReader wraps an io.Reader to simulate slow network download speeds with random delays
@@ -102,6 +117,7 @@ func main() {
 	duration := flag.Duration("duration", 30*time.Second, "Test duration")
 	hogTest := flag.Bool("hog-test", false, "Run connection hogging test (many slow clients, measure fast client impact)")
 	mode := flag.String("mode", "normal", "Test mode: 'normal' (all fast) or 'saturation' (mix of slow/fast)")
+	outputFile := flag.String("output", "load_test_results.md", "Output file for results")
 	flag.Parse()
 
 	// Apply mode presets
@@ -117,6 +133,7 @@ func main() {
 		SlowDownloadSpeed: *slowSpeed,
 		TestDuration:      *duration,
 		ConnectionHogTest: *hogTest,
+		OutputFile:        *outputFile,
 	}
 
 	// Adjust settings for saturation/hogging test
@@ -167,6 +184,7 @@ func main() {
 	stats := &Stats{
 		fastLatencies: make([]int64, 0, 10000),
 		slowLatencies: make([]int64, 0, 10000),
+		allocations:   make(map[string]map[string]int),
 	}
 
 	// Start monitoring
@@ -257,13 +275,14 @@ func runFastClient(_ int, config TestConfig, stats *Stats, ctx chan bool) {
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
+	userID := uuid.New().String() // Each client is a unique user
 
 	for i := 0; i < config.RequestsPerClient; i++ {
 		select {
 		case <-ctx:
 			return
 		default:
-			makeFastRequest(client, config.ServerURL+"/experiment", stats)
+			makeFastRequest(client, config.ServerURL+"/experiment", userID, stats)
 			stats.fastRequests.Add(1)
 			// Small delay between requests
 			time.Sleep(50 * time.Millisecond)
@@ -275,13 +294,14 @@ func runSlowClient(_ int, config TestConfig, stats *Stats, ctx chan bool) {
 	client := &http.Client{
 		Timeout: 60 * time.Second, // Longer timeout for slow downloads
 	}
+	userID := uuid.New().String() // Each client is a unique user
 
 	for i := 0; i < config.RequestsPerClient; i++ {
 		select {
 		case <-ctx:
 			return
 		default:
-			makeSlowRequest(client, config.ServerURL+"/experiment", config.SlowDownloadSpeed, stats)
+			makeSlowRequest(client, config.ServerURL+"/experiment", userID, config.SlowDownloadSpeed, stats)
 			stats.slowRequests.Add(1)
 			// Small delay between requests
 			time.Sleep(100 * time.Millisecond)
@@ -289,17 +309,30 @@ func runSlowClient(_ int, config TestConfig, stats *Stats, ctx chan bool) {
 	}
 }
 
-func makeFastRequest(client *http.Client, url string, stats *Stats) {
+// trackAllocation records which payload a user received for determinism verification
+func trackAllocation(stats *Stats, userID string, body []byte) {
+	var expResp ExperimentResponse
+	if err := json.Unmarshal(body, &expResp); err == nil {
+		stats.allocationMu.Lock()
+		if stats.allocations[userID] == nil {
+			stats.allocations[userID] = make(map[string]int)
+		}
+		stats.allocations[userID][expResp.SelectedPayloadName]++
+		stats.allocationMu.Unlock()
+	}
+}
+
+func makeFastRequest(client *http.Client, url string, userID string, stats *Stats) {
 	stats.totalRequests.Add(1)
 
-	payload := map[string]string{
+	reqBody, _ := json.Marshal(map[string]string{
+		"userId":    userID,
 		"type":      "fast",
 		"timestamp": time.Now().Format(time.RFC3339),
-	}
-	jsonData, _ := json.Marshal(payload)
+	})
 
 	start := time.Now()
-	resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := client.Post(url, "application/json", bytes.NewReader(reqBody))
 
 	if err != nil {
 		stats.failedRequests.Add(1)
@@ -309,7 +342,7 @@ func makeFastRequest(client *http.Client, url string, stats *Stats) {
 
 	if resp.StatusCode == http.StatusOK {
 		// Read response body normally (fast)
-		_, err = io.Copy(io.Discard, resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		latency := time.Since(start).Milliseconds()
 
 		if err == nil {
@@ -317,6 +350,7 @@ func makeFastRequest(client *http.Client, url string, stats *Stats) {
 			stats.latenciesMutex.Lock()
 			stats.fastLatencies = append(stats.fastLatencies, latency)
 			stats.latenciesMutex.Unlock()
+			trackAllocation(stats, userID, body)
 		} else {
 			stats.failedRequests.Add(1)
 		}
@@ -325,17 +359,17 @@ func makeFastRequest(client *http.Client, url string, stats *Stats) {
 	}
 }
 
-func makeSlowRequest(client *http.Client, url string, bytesPerSec int, stats *Stats) {
+func makeSlowRequest(client *http.Client, url string, userID string, bytesPerSec int, stats *Stats) {
 	stats.totalRequests.Add(1)
 
-	payload := map[string]string{
+	reqBody, _ := json.Marshal(map[string]string{
+		"userId":    userID,
 		"type":      "slow",
 		"timestamp": time.Now().Format(time.RFC3339),
-	}
-	jsonData, _ := json.Marshal(payload)
+	})
 
 	start := time.Now()
-	resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := client.Post(url, "application/json", bytes.NewReader(reqBody))
 
 	if err != nil {
 		stats.failedRequests.Add(1)
@@ -346,7 +380,7 @@ func makeSlowRequest(client *http.Client, url string, bytesPerSec int, stats *St
 	if resp.StatusCode == http.StatusOK {
 		// Simulate slow network by reading response body slowly with random delays
 		slowReader := NewSlowReader(resp.Body, bytesPerSec)
-		_, err = io.Copy(io.Discard, slowReader)
+		body, err := io.ReadAll(slowReader)
 		latency := time.Since(start).Milliseconds()
 
 		if err == nil {
@@ -354,6 +388,7 @@ func makeSlowRequest(client *http.Client, url string, bytesPerSec int, stats *St
 			stats.latenciesMutex.Lock()
 			stats.slowLatencies = append(stats.slowLatencies, latency)
 			stats.latenciesMutex.Unlock()
+			trackAllocation(stats, userID, body)
 		} else {
 			stats.failedRequests.Add(1)
 		}
@@ -616,5 +651,149 @@ func printResults(stats *Stats, startTime, endTime time.Time, config TestConfig)
 		}
 	}
 
+	// Allocation determinism analysis
+	fmt.Println()
+	fmt.Println("Allocation Determinism Check:")
+	stats.allocationMu.Lock()
+	totalUsers := len(stats.allocations)
+	consistentUsers := 0
+	inconsistentUsers := 0
+	payloadDist := make(map[string]int) // payload -> number of users
+	for _, payloads := range stats.allocations {
+		if len(payloads) == 1 {
+			consistentUsers++
+			for name := range payloads {
+				payloadDist[name]++
+			}
+		} else {
+			inconsistentUsers++
+		}
+	}
+	stats.allocationMu.Unlock()
+
+	fmt.Printf("  Total Users:      %d\n", totalUsers)
+	fmt.Printf("  Consistent:       %d/%d (%.1f%%)\n", consistentUsers, totalUsers, float64(consistentUsers)/float64(totalUsers)*100)
+	fmt.Printf("  Inconsistent:     %d\n", inconsistentUsers)
+	if inconsistentUsers == 0 {
+		fmt.Println("  PASS - Every user received the same payload on every request")
+	} else {
+		fmt.Println("  FAIL - Some users received different payloads across requests")
+	}
+	fmt.Println()
+
+	fmt.Println("Payload Distribution:")
+	payloadNames := make([]string, 0, len(payloadDist))
+	for name := range payloadDist {
+		payloadNames = append(payloadNames, name)
+	}
+	sort.Strings(payloadNames)
+	for _, name := range payloadNames {
+		count := payloadDist[name]
+		pct := float64(count) / float64(consistentUsers) * 100
+		bar := ""
+		for b := 0; b < int(pct/2); b++ {
+			bar += "#"
+		}
+		fmt.Printf("  %-35s %3d users (%5.1f%%) %s\n", name, count, pct, bar)
+	}
+
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	// Write results to file
+	writeResultsFile(config, stats, duration, totalRequests, successRequests, failedRequests,
+		fastRequests, slowRequests, allLatencies, fastLatencies, slowLatencies,
+		consistentUsers, inconsistentUsers, totalUsers, payloadDist, payloadNames)
+}
+
+func writeResultsFile(config TestConfig, stats *Stats, duration time.Duration,
+	totalReqs, successReqs, failedReqs, fastReqs, slowReqs int64,
+	allLat, fastLat, slowLat []int64,
+	consistent, inconsistent, totalUsers int,
+	payloadDist map[string]int, payloadNames []string) {
+
+	var buf bytes.Buffer
+	w := func(format string, args ...any) { fmt.Fprintf(&buf, format, args...) }
+
+	w("# Load Test Results\n\n")
+	w("Date: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
+
+	w("## Test Configuration\n\n")
+	w("- Server URL:          %s\n", config.ServerURL)
+	w("- Fast Clients:        %d\n", config.FastClients)
+	w("- Slow Clients:        %d\n", config.SlowClients)
+	w("- Requests per Client: %d\n", config.RequestsPerClient)
+	w("- Slow Download Speed: %d bytes/sec\n", config.SlowDownloadSpeed)
+	w("- Duration:            %s\n", duration.Round(time.Millisecond))
+	if config.ConnectionHogTest {
+		w("- Mode:                Connection Hogging Test\n")
+	}
+	w("\n")
+
+	w("## Performance Results\n\n")
+	w("- Total Requests:  %d\n", totalReqs)
+	w("- Successful:      %d (%.2f%%)\n", successReqs, float64(successReqs)/float64(totalReqs)*100)
+	w("- Failed:          %d (%.2f%%)\n", failedReqs, float64(failedReqs)/float64(totalReqs)*100)
+	w("- Fast Requests:   %d\n", fastReqs)
+	w("- Slow Requests:   %d\n", slowReqs)
+	w("- Throughput:      %.2f req/s\n\n", float64(successReqs)/duration.Seconds())
+
+	if len(allLat) > 0 {
+		w("### Overall Latency\n\n")
+		w("```\n")
+		w("  Min:    %d ms\n", allLat[0])
+		w("  p50:    %d ms\n", calculatePercentile(allLat, 0.50))
+		w("  p90:    %d ms\n", calculatePercentile(allLat, 0.90))
+		w("  p99:    %d ms\n", calculatePercentile(allLat, 0.99))
+		w("  Max:    %d ms\n", allLat[len(allLat)-1])
+		w("```\n\n")
+	}
+
+	if len(fastLat) > 0 {
+		w("### Fast Client Latency\n\n")
+		w("```\n")
+		w("  Min:    %d ms\n", fastLat[0])
+		w("  p50:    %d ms\n", calculatePercentile(fastLat, 0.50))
+		w("  p90:    %d ms\n", calculatePercentile(fastLat, 0.90))
+		w("  p99:    %d ms\n", calculatePercentile(fastLat, 0.99))
+		w("  Max:    %d ms\n", fastLat[len(fastLat)-1])
+		w("```\n\n")
+	}
+
+	if len(slowLat) > 0 {
+		w("### Slow Client Latency\n\n")
+		w("```\n")
+		w("  Min:    %d ms\n", slowLat[0])
+		w("  p50:    %d ms\n", calculatePercentile(slowLat, 0.50))
+		w("  p90:    %d ms\n", calculatePercentile(slowLat, 0.90))
+		w("  p99:    %d ms\n", calculatePercentile(slowLat, 0.99))
+		w("  Max:    %d ms\n", slowLat[len(slowLat)-1])
+		w("```\n\n")
+	}
+
+	w("## Allocation Determinism\n\n")
+	w("- Total Users:      %d\n", totalUsers)
+	w("- Consistent:       %d/%d (%.1f%%)\n", consistent, totalUsers, float64(consistent)/float64(totalUsers)*100)
+	w("- Inconsistent:     %d\n\n", inconsistent)
+
+	if inconsistent == 0 {
+		w("**PASS** - Every user received the same payload on every request.\n\n")
+	} else {
+		w("**FAIL** - Some users received different payloads across requests.\n\n")
+	}
+
+	w("### Payload Distribution\n\n")
+	w("```\n")
+	for _, name := range payloadNames {
+		count := payloadDist[name]
+		pct := float64(count) / float64(consistent) * 100
+		bar := ""
+		for b := 0; b < int(pct/2); b++ {
+			bar += "#"
+		}
+		w("  %-35s %3d users (%5.1f%%) %s\n", name, count, pct, bar)
+	}
+	w("```\n")
+
+	os.WriteFile(config.OutputFile, buf.Bytes(), 0644)
+	fmt.Printf("\nResults written to %s\n", config.OutputFile)
 }
