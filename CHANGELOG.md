@@ -115,3 +115,24 @@ Payload Distribution:
 
 - `cmd/loadtest/main.go` — added userId per client, allocation tracking, determinism analysis, and file output
 - `cmd/allocation-test/main.go` — standalone allocation test (can also be used independently)
+
+---
+
+## Task 3: Production Hardening
+
+### The Problem
+
+When the server sends ~1MB responses, slow clients (poor network connections) hold connections open while downloading. A fast client takes ~10ms; a slow one at 128KB/s takes ~8 seconds. If enough slow clients pile up, they exhaust the connection pool, causing fast clients to queue even though the server's CPU is idle.
+
+### What I'd Do
+
+**Layer 1: Limit how long slow clients can hold connections**
+
+- **WriteTimeout (10s)** — if the client can't receive the full response within 10 seconds, drop the connection. Puts a hard cap on how long any slow client can occupy a connection.
+- **ReadTimeout (5s)** — max time to read the full request. Prevents slowloris-style attacks where clients send headers very slowly.
+- **IdleTimeout (30s)** — closes keep-alive connections that sit idle. Prevents pool exhaustion from clients that connect and never send.
+- **Concurrency limit** — cap max connections (e.g., 512) so the server rejects excess load rather than degrading into unresponsiveness.
+
+**Layer 2: Architectural (production deployment)**
+
+- **CDN for payloads** — since the payloads are static files that don't change per-request, they can be pre-uploaded to a CDN. The server resolves the cohort and responds with a 302 redirect to the CDN URL (e.g., `cdn.example.com/payloads/localization_dummy_3.json`). The client follows the redirect and downloads the large payload from the CDN edge, not from our server. One request from the client's perspective, but the Go server only does the lightweight bucketing — the CDN handles the slow download.
